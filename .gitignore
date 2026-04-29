@@ -1,5 +1,4 @@
-debug.log
-lab4/device_list.csv
-lab4/input.log
+src/vboxapi/
+src/vboxapisetup.py
 
 __pycache__/
