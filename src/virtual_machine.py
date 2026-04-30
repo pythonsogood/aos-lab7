@@ -359,3 +359,6 @@ class VirtualMachine:
 
 			self.__used_cpu = used_cpu_user + used_cpu_kernel
 			self.__used_memory = used_memory
+
+		self.__used_cpu = 0
+		self.__used_memory = 0
