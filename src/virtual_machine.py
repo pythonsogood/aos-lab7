@@ -1,4 +1,6 @@
+import math
 import time
+from threading import Thread
 from typing import Any, Literal, NamedTuple, NotRequired, TypedDict
 
 import vboxapi
@@ -46,6 +48,11 @@ class VirtualMachine:
 
 		self.__running_apps = []
 
+		self.__used_memory = 0
+
+		self.__perf_monitor_state = False
+		self.__perf_monitor_thread: Thread | None = None
+
 	@property
 	def id(self) -> int:
 		return self.__id
@@ -70,13 +77,13 @@ class VirtualMachine:
 	def total_storage(self) -> int:
 		return self.get_virtualbox_storage_info().total
 
-	# @property
-	# def available_cpu(self) -> int:
-	# 	return self.__available_cpu
+	@property
+	def available_cpu(self) -> int:
+		return math.floor(self.total_cpu * self.__used_cpu / 100)
 
 	@property
 	def available_memory(self) -> int:
-		return self.total_memory - self.get_memory_utilization()
+		return self.total_memory - self.__used_memory
 
 	@property
 	def available_storage(self) -> int:
@@ -97,6 +104,12 @@ class VirtualMachine:
 
 		session.unlockMachine()
 
+		self.__perf_monitor_state = True
+
+		if self.__perf_monitor_thread is None:
+			self.__perf_monitor_thread = Thread(target=self.__perf_monitor)
+			self.__perf_monitor_thread.start()
+
 	def stop_vm(self) -> None:
 		session = self.__vbox_manager.getSessionObject(self.__vbox)
 		self.__machine.lockMachine(session, self.__vbox_manager.constants.LockType_Shared)
@@ -108,6 +121,8 @@ class VirtualMachine:
 		print(f"Stopped VM {self.name}")
 
 		session.unlockMachine()
+
+		self.__perf_monitor_state = False
 
 	def run_app(self, app_name: str, executable: str, args: list[str] | None = None) -> None:
 		if args is None:
@@ -243,68 +258,12 @@ class VirtualMachine:
 
 		return VirtualMachineStorageInfo(used=round(total_physical_bytes / (1024 ** 3), 2), total=round(total_logical_bytes / (1024 ** 3), 2), disks=disks)
 
-	def get_memory_utilization(self) -> int:
-		self.__vbox.performanceCollector.setupMetrics(("RAM/Usage",), (self.__machine,), 1, 5)
-
-		time.sleep(1)
-
-		(
-			values,
-			names,
-			objects,
-			units,
-			scales,
-			sequence_numbers,
-			indices,
-			lengths,
-		) = self.__vbox.performanceCollector.queryMetricsData(("RAM/Usage/Used",), (self.__machine,))
-
-		values = list(values)
-		names = list(names)
-		units = list(units)
-		scales = list(scales)
-		indices = list(indices)
-		lengths = list(lengths)
-
-		for i, name in enumerate(names):
-			if name != "RAM/Usage/Used":
-				continue
-
-			index = int(indices[i])
-			length = int(lengths[i])
-
-			raw_samples = values[index:index + length]
-
-			if not raw_samples:
-				continue
-
-			latest_value = raw_samples[-1]
-
-			scale = scales[i] if scales[i] else 1
-			value = latest_value / scale
-
-			unit = units[i].lower()
-
-			if unit in ("kb", "kbytes", "kilobytes"):
-				memory_used_mb = value / 1024
-			elif unit in ("mb", "mbytes", "megabytes"):
-				memory_used_mb = value
-			elif unit in ("b", "bytes"):
-				memory_used_mb = value / (1024 ** 2)
-			else:
-				memory_used_mb = value / 1024
-
-			return int(memory_used_mb)
-
-		return 0
-
 	def calculate_utilization(self) -> VirtualMachineUtilization:
-		memory_usage = self.get_memory_utilization()
 		storage_info = self.get_virtualbox_storage_info()
 
 		return VirtualMachineUtilization(
 			cpu_percent=0,
-			memory_percent=memory_usage / self.total_memory * 100,
+			memory_percent=self.__used_memory / self.total_memory * 100,
 			storage_percent=round(storage_info.used / storage_info.total * 100)
 		)
 
@@ -317,3 +276,82 @@ class VirtualMachine:
 			f"Memory: {self.available_memory / self.total_memory} MB,\n"
 			f"Storage: {storage_info.used}/{storage_info.total} GB"
 		)
+
+	def __perf_monitor(self) -> None:
+		while self.__perf_monitor_state:
+			self.__vbox.performanceCollector.setupMetrics(
+				(
+					"CPU/Load/User",
+					"CPU/Load/Kernel",
+					"RAM/Usage",
+				),
+				(self.__machine,),
+				1,
+				5
+			)
+
+			time.sleep(5)
+
+			(
+				values,
+				names,
+				objects,
+				units,
+				scales,
+				sequence_numbers,
+				indices,
+				lengths,
+			) = self.__vbox.performanceCollector.queryMetricsData(
+				(
+					"CPU/Load/User",
+					"CPU/Load/Kernel",
+					"RAM/Usage/Used",
+				),
+				(self.__machine,)
+			)
+
+			values = list(values)
+			names = list(names)
+			units = list(units)
+			scales = list(scales)
+			indices = list(indices)
+			lengths = list(lengths)
+
+			used_cpu_user = 0.0
+			used_cpu_kernel = 0.0
+			used_memory = 0
+
+			for i, name in enumerate(names):
+				index = int(indices[i])
+				length = int(lengths[i])
+
+				raw_samples = values[index:index + length]
+
+				if not raw_samples:
+					continue
+
+				latest_value = raw_samples[-1]
+
+				scale = scales[i] if scales[i] else 1
+				value = latest_value / scale
+
+				unit = units[i].lower()
+
+				if name == "CPU/Load/User":
+					used_cpu_user = float(value)
+				elif name == "CPU/Load/Kernel":
+					used_cpu_kernel = float(value)
+				elif name == "RAM/Usage/Used":
+					if unit in ("kb", "kbytes", "kilobytes"):
+						memory_used_mb = value / 1024
+					elif unit in ("mb", "mbytes", "megabytes"):
+						memory_used_mb = value
+					elif unit in ("b", "bytes"):
+						memory_used_mb = value / (1024 ** 2)
+					else:
+						memory_used_mb = value / 1024
+
+					used_memory = int(memory_used_mb) or 0
+
+			self.__used_cpu = used_cpu_user + used_cpu_kernel
+			self.__used_memory = used_memory
