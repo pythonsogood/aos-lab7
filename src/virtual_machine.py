@@ -111,6 +111,12 @@ class VirtualMachine:
 			self.__perf_monitor_thread.start()
 
 	def stop_vm(self) -> None:
+		self.__perf_monitor_state = False
+
+		if (perf_thread := self.__perf_monitor_thread) is not None:
+			perf_thread.join()
+			self.__perf_monitor_thread = None
+
 		session = self.__vbox_manager.getSessionObject(self.__vbox)
 		self.__machine.lockMachine(session, self.__vbox_manager.constants.LockType_Shared)
 
@@ -121,8 +127,6 @@ class VirtualMachine:
 		print(f"Stopped VM {self.name}")
 
 		session.unlockMachine()
-
-		self.__perf_monitor_state = False
 
 	def run_app(self, app_name: str, executable: str, args: list[str] | None = None) -> None:
 		if args is None:
