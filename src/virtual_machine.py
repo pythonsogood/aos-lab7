@@ -2,8 +2,9 @@ import math
 import time
 from contextlib import suppress
 from threading import Thread
-from typing import Any, Iterable, Literal, NamedTuple, NotRequired, TypedDict
+from typing import Any, Iterable, Literal, NamedTuple
 
+import pywintypes
 import vboxapi
 
 
@@ -30,12 +31,6 @@ class VirtualMachineUtilization(NamedTuple):
 	storage_percent: float
 
 
-class VirtualMachineRunningApp(TypedDict):
-	app_name: str
-	process_name: int
-	process_id: NotRequired[int]
-
-
 class VirtualMachine:
 	def __init__(self, id: int, machine: Any, manager: vboxapi.VirtualBoxManager, username: str, password: str) -> None:
 		self.__id = id
@@ -49,6 +44,7 @@ class VirtualMachine:
 
 		self.__running_apps = []
 
+		self.__used_cpu = 0
 		self.__used_memory = 0
 
 		self.__guest_session: Any | None = None
@@ -67,7 +63,7 @@ class VirtualMachine:
 
 	@property
 	def os(self) -> str:
-		return self.__machine.OSType
+		return self.__machine.OSTypeId
 
 	@property
 	def total_cpu(self) -> int:
@@ -101,7 +97,7 @@ class VirtualMachine:
 
 	def start_vm(self, frontend: VirtualBoxFrontend = "headless") -> None:
 		session = self.__vbox_manager.getSessionObject(self.__vbox)
-		progress = self.__machine.launchVMProcess(session, frontend, "")
+		progress = self.__machine.launchVMProcess(session, frontend, ())
 		progress.waitForCompletion(-1)
 
 		print(f"Started VM {self.name}")
@@ -111,7 +107,7 @@ class VirtualMachine:
 		self.__perf_monitor_state = True
 
 		if self.__perf_monitor_thread is None:
-			self.__perf_monitor_thread = Thread(target=self.__perf_monitor)
+			self.__perf_monitor_thread = Thread(target=self.__perf_monitor, daemon=True)
 			self.__perf_monitor_thread.start()
 
 	def stop_vm(self) -> None:
@@ -152,12 +148,12 @@ class VirtualMachine:
 
 		self.__running_apps.append(guest_process)
 
-		print(f"Running {guest_process.Name} on {self.name}.")
+		print(f"Running {guest_process.Name if guest_process.Name.strip() else f'{executable} with PID {guest_process.PID}'} on {self.name}.")
 
 		return guest_process.PID
 
 	def stop_app(self, process_id: int) -> None:
-		for app in self.__running_apps:
+		for i, app in enumerate(self.__running_apps):
 			if app.PID == process_id:
 				app_name = app.Name
 
@@ -168,7 +164,9 @@ class VirtualMachine:
 				except Exception:
 					self._kill_pid(process_id)
 
-				print(f"Stopped app {app_name} on {self.name}.")
+				print(f"Stopped app {app_name if app_name.strip() else f'with PID {process_id}'} on {self.name}.")
+
+				self.__running_apps.pop(i)
 				break
 		else:
 			self._kill_pid(process_id)
@@ -208,20 +206,15 @@ class VirtualMachine:
 		storage_info = self.get_virtualbox_storage_info()
 
 		return VirtualMachineUtilization(
-			cpu_percent=0,
-			memory_percent=self.__used_memory / self.total_memory * 100,
-			storage_percent=round(storage_info.used / storage_info.total * 100)
+			cpu_percent=self.__used_cpu,
+			memory_percent=self.__used_memory / self.total_memory * 100 if self.total_memory > 0 else 0,
+			storage_percent=round(storage_info.used / storage_info.total * 100) if storage_info.total > 0 else 0
 		)
 
 	def show_specs(self) -> None:
 		storage_info = self.get_virtualbox_storage_info()
 
-		print(
-			f"VM Name: {self.name},\n"
-			f"CPU: {self.total_cpu},\n"
-			f"Memory: {self.available_memory / self.total_memory} MB,\n"
-			f"Storage: {storage_info.used}/{storage_info.total} GB"
-		)
+		print(f"VM Name: {self.name}, CPU: {self.total_cpu}, Memory: {self.available_memory}/{self.total_memory}, Storage: {storage_info.used}/{storage_info.total}")
 
 	def _kill_pid(self, process_id: int) -> None:
 		self._create_guest_session()
@@ -253,16 +246,45 @@ class VirtualMachine:
 		if self.__guest_session is not None:
 			return
 
-		session = self.__vbox_manager.getSessionObject(self.__vbox)
+		last_error: Exception | None = None
 
-		self.__machine.lockMachine(session, self.__vbox_manager.constants.LockType_Shared)
+		for attempt in range(1, 11):
+			session = self.__vbox_manager.getSessionObject(self.__vbox)
 
-		guest_session = session.console.guest.createSession(self.__guest_username, self.__guest_password, "", f"{self.name}-guest-session")
+			try:
+				self.__machine.lockMachine(session, self.__vbox_manager.constants.LockType_Shared)
+				guest_session = session.console.guest.createSession(
+					self.__guest_username,
+					self.__guest_password,
+					"",
+					f"{self.name}-guest-session",
+				)
+				guest_session.waitForArray((self.__vbox_manager.constants.GuestSessionWaitForFlag_Start,), 5000)
+			except pywintypes.com_error as error:
+				last_error = error
+				with suppress(Exception):
+					session.unlockMachine()
 
-		guest_session.waitForArray((self.__vbox_manager.constants.GuestSessionWaitForFlag_Start,), 3000)
+				if attempt < 10:
+					print(f"Guest execution service not ready on {self.name} (attempt {attempt}/10); retrying...")
+					time.sleep(5)
+					continue
 
-		self.__control_session = session
-		self.__guest_session = guest_session
+				raise
+			except Exception as error:
+				last_error = error
+				with suppress(Exception):
+					session.unlockMachine()
+				raise
+			else:
+				self.__control_session = session
+				self.__guest_session = guest_session
+				return
+
+		if last_error is not None:
+			raise last_error
+
+		raise RuntimeError(f"Failed to create guest session on {self.name}")
 
 	def _close_guest_session(self) -> None:
 		if self.__guest_session is not None:
@@ -279,82 +301,88 @@ class VirtualMachine:
 
 	def __perf_monitor(self) -> None:
 		while self.__perf_monitor_state:
-			self.__vbox.performanceCollector.setupMetrics(
+			try:
+				self.__vbox.performanceCollector.setupMetrics(
+					(
+						"CPU/Load/User",
+						"CPU/Load/Kernel",
+						"RAM/Usage",
+					),
+					(self.__machine,),
+					1,
+					5
+				)
+
+				time.sleep(5)
+
 				(
-					"CPU/Load/User",
-					"CPU/Load/Kernel",
-					"RAM/Usage",
-				),
-				(self.__machine,),
-				1,
-				5
-			)
+					values,
+					names,
+					objects,
+					units,
+					scales,
+					sequence_numbers,
+					indices,
+					lengths,
+				) = self.__vbox.performanceCollector.queryMetricsData(
+					(
+						"CPU/Load/User",
+						"CPU/Load/Kernel",
+						"RAM/Usage/Used",
+					),
+					(self.__machine,)
+				)
 
-			time.sleep(5)
+				values = list(values)
+				names = list(names)
+				units = list(units)
+				scales = list(scales)
+				indices = list(indices)
+				lengths = list(lengths)
 
-			(
-				values,
-				names,
-				objects,
-				units,
-				scales,
-				sequence_numbers,
-				indices,
-				lengths,
-			) = self.__vbox.performanceCollector.queryMetricsData(
-				(
-					"CPU/Load/User",
-					"CPU/Load/Kernel",
-					"RAM/Usage/Used",
-				),
-				(self.__machine,)
-			)
+				used_cpu_user = 0.0
+				used_cpu_kernel = 0.0
+				used_memory = 0
 
-			values = list(values)
-			names = list(names)
-			units = list(units)
-			scales = list(scales)
-			indices = list(indices)
-			lengths = list(lengths)
+				for i, name in enumerate(names):
+					index = int(indices[i])
+					length = int(lengths[i])
 
-			used_cpu_user = 0.0
-			used_cpu_kernel = 0.0
-			used_memory = 0
+					raw_samples = values[index:index + length]
 
-			for i, name in enumerate(names):
-				index = int(indices[i])
-				length = int(lengths[i])
+					if not raw_samples:
+						continue
 
-				raw_samples = values[index:index + length]
+					latest_value = raw_samples[-1]
 
-				if not raw_samples:
-					continue
+					scale = scales[i] if scales[i] else 1
+					value = latest_value / scale
 
-				latest_value = raw_samples[-1]
+					unit = units[i].lower()
 
-				scale = scales[i] if scales[i] else 1
-				value = latest_value / scale
+					if name == "CPU/Load/User":
+						used_cpu_user = float(value)
+					elif name == "CPU/Load/Kernel":
+						used_cpu_kernel = float(value)
+					elif name == "RAM/Usage/Used":
+						if unit in ("kb", "kbytes", "kilobytes"):
+							memory_used_mb = value / 1024
+						elif unit in ("mb", "mbytes", "megabytes"):
+							memory_used_mb = value
+						elif unit in ("b", "bytes"):
+							memory_used_mb = value / (1024 ** 2)
+						else:
+							memory_used_mb = value / 1024
 
-				unit = units[i].lower()
+						used_memory = int(memory_used_mb) or 0
 
-				if name == "CPU/Load/User":
-					used_cpu_user = float(value)
-				elif name == "CPU/Load/Kernel":
-					used_cpu_kernel = float(value)
-				elif name == "RAM/Usage/Used":
-					if unit in ("kb", "kbytes", "kilobytes"):
-						memory_used_mb = value / 1024
-					elif unit in ("mb", "mbytes", "megabytes"):
-						memory_used_mb = value
-					elif unit in ("b", "bytes"):
-						memory_used_mb = value / (1024 ** 2)
-					else:
-						memory_used_mb = value / 1024
-
-					used_memory = int(memory_used_mb) or 0
-
-			self.__used_cpu = used_cpu_user + used_cpu_kernel
-			self.__used_memory = used_memory
+				self.__used_cpu = used_cpu_user + used_cpu_kernel
+				self.__used_memory = used_memory
+			except Exception:
+				pass
+			except KeyboardInterrupt:
+				self.__perf_monitor_state = False
+				break
 
 		self.__used_cpu = 0
 		self.__used_memory = 0
