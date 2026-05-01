@@ -1,7 +1,8 @@
 import math
 import time
+from contextlib import suppress
 from threading import Thread
-from typing import Any, Literal, NamedTuple, NotRequired, TypedDict
+from typing import Any, Iterable, Literal, NamedTuple, NotRequired, TypedDict
 
 import vboxapi
 
@@ -50,6 +51,9 @@ class VirtualMachine:
 
 		self.__used_memory = 0
 
+		self.__guest_session: Any | None = None
+		self.__control_session: Any | None = None
+
 		self.__perf_monitor_state = False
 		self.__perf_monitor_thread: Thread | None = None
 
@@ -92,7 +96,7 @@ class VirtualMachine:
 		return storage_info.total - storage_info.used
 
 	@property
-	def running_apps(self) -> tuple[VirtualMachineRunningApp, ...]:
+	def running_apps(self) -> tuple[Any, ...]:
 		return tuple(self.__running_apps)
 
 	def start_vm(self, frontend: VirtualBoxFrontend = "headless") -> None:
@@ -117,121 +121,59 @@ class VirtualMachine:
 			perf_thread.join()
 			self.__perf_monitor_thread = None
 
+		self._close_guest_session()
+
 		session = self.__vbox_manager.getSessionObject(self.__vbox)
 		self.__machine.lockMachine(session, self.__vbox_manager.constants.LockType_Shared)
 
-		console = session.console
-		progress = console.powerDown()
-		progress.waitForCompletion(-1)
+		try:
+			progress = session.console.powerDown()
+			progress.waitForCompletion(-1)
+			print(f"Stopped VM {self.name}")
+		finally:
+			session.unlockMachine()
 
-		print(f"Stopped VM {self.name}")
-
-		session.unlockMachine()
-
-	def run_app(self, app_name: str, executable: str, args: list[str] | None = None) -> None:
+	def run_app(self, executable: str, args: Iterable[str] | None = None) -> int:
 		if args is None:
-			args = []
+			args = ()
 
-		session = self.__vbox_manager.getSessionObject(self.__vbox)
+		self._create_guest_session()
 
-		try:
-			self.__machine.lockMachine(session, self.__vbox_manager.constants.LockType_Shared)
-			console = session.console
-			guest = console.guest
+		if self.__guest_session is None:
+			raise ValueError("Guest session is not created")
 
-			process = guest.createSession(
-				self.__guest_username,
-				self.__guest_password,
-				"",
-				f"{self.name}-guest-session",
-			)
+		environment_changes = ()
 
-			process.waitForArray(
-				(self.__vbox_manager.constants.GuestSessionWaitForFlag_Start,),
-				30000,
-			)
+		guest_process = self.__guest_session.processCreate(executable, (executable, *args), "", environment_changes, (
+			self.__vbox_manager.constants.ProcessCreateFlag_WaitForProcessStartOnly,
+		), 0)
 
-			arguments = [executable] + args
-			environment_changes = []
-			flags = [
-				self.__vbox_manager.constants.ProcessCreateFlag_WaitForStdOut,
-				self.__vbox_manager.constants.ProcessCreateFlag_WaitForStdErr,
-			]
+		guest_process.waitForArray((self.__vbox_manager.constants.ProcessWaitForFlag_Start,), 30000)
 
-			guest_process = process.processCreate(
-				executable,
-				arguments,
-				"",
-				environment_changes,
-				flags,
-				30000,
-			)
+		self.__running_apps.append(guest_process)
 
-			print(guest_process)
+		print(f"Running {guest_process.Name} on {self.name}.")
 
-			pid = guest_process.PID
-			self.__running_apps.append(VirtualMachineRunningApp(app_name=app_name, pid=pid))
+		return guest_process.PID
 
-			print(f"Running {app_name} on {self.name}. Guest PID: {pid}")
-
-			process.close()
-		finally:
-			session.unlockMachine()
-
-	def stop_app(self, app_name: str) -> None:
-		target = None
-
+	def stop_app(self, process_id: int) -> None:
 		for app in self.__running_apps:
-			if app.app_name == app_name:
-				target = app
+			if app.PID == process_id:
+				app_name = app.Name
+
+				try:
+					app.terminate()
+
+					app.waitForArray((self.__vbox_manager.constants.ProcessWaitForFlag_Terminate,), 3000)
+				except Exception:
+					self._kill_pid(process_id)
+
+				print(f"Stopped app {app_name} on {self.name}.")
 				break
+		else:
+			self._kill_pid(process_id)
 
-		if target is None:
-			return
-
-		session = self.__vbox_manager.getSessionObject(self.__vbox)
-
-		try:
-			self.__machine.lockMachine(session, self.__vbox_manager.constants.LockType_Shared)
-			console = session.console
-			guest = console.guest
-
-			guest_session = guest.createSession(
-				self.__guest_username,
-				self.__guest_password,
-				"",
-				f"{self.name}-stop-session",
-			)
-
-			guest_session.waitForArray(
-				[self.__vbox_manager.constants.GuestSessionWaitForFlag_Start],
-				30000,
-			)
-
-			os_type = self.__machine.OSTypeId.lower()
-
-			if "windows" in os_type:
-				executable = "C:\\Windows\\System32\\taskkill.exe"
-				args = (executable, "/PID", str(target.pid), "/F")
-			else:
-				executable = "/bin/kill"
-				args = (executable, "-9", str(target.pid))
-
-			guest_session.processCreate(
-				executable,
-				args,
-				tuple(),
-				(self.__vbox_manager.constants.ProcessCreateFlag_WaitForProcessStartOnly),
-				30000,
-			)
-
-			self.__running_apps.remove(target)
-			print(f"Stopped {app_name} on {self.name}. Guest PID: {target.pid}")
-
-			guest_session.close()
-
-		finally:
-			session.unlockMachine()
+			print(f"Stopped app with PID {process_id} on {self.name}.")
 
 	def get_virtualbox_storage_info(self) -> VirtualMachineStorageInfo:
 		total_logical_bytes = 0
@@ -256,8 +198,8 @@ class VirtualMachine:
 				name=medium.name,
 				location=medium.location,
 				format=medium.format,
-				used=round(logical_bytes / (1024 ** 3), 2),
-				total=round(physical_bytes / (1024 ** 3), 2),
+				used=round(physical_bytes / (1024 ** 3), 2),
+				total=round(logical_bytes / (1024 ** 3), 2),
 			))
 
 		return VirtualMachineStorageInfo(used=round(total_physical_bytes / (1024 ** 3), 2), total=round(total_logical_bytes / (1024 ** 3), 2), disks=disks)
@@ -280,6 +222,60 @@ class VirtualMachine:
 			f"Memory: {self.available_memory / self.total_memory} MB,\n"
 			f"Storage: {storage_info.used}/{storage_info.total} GB"
 		)
+
+	def _kill_pid(self, process_id: int) -> None:
+		self._create_guest_session()
+
+		if self.__guest_session is None:
+			raise ValueError("Guest session is not created")
+
+		executable = "/bin/kill"
+		args = (executable, "-9", str(process_id))
+		environment_changes = ()
+
+		os_type = self.__machine.OSTypeId.lower()
+
+		if "windows" in os_type:
+			executable = r"C:\Windows\System32\taskkill.exe"
+			args = (executable, "/PID", str(process_id), "/F")
+
+		kill_process = self.__guest_session.processCreate(
+			executable,
+			args,
+			environment_changes,
+			(self.__vbox_manager.constants.ProcessCreateFlag_WaitForProcessStartOnly,),
+			30000,
+		)
+
+		kill_process.waitForArray((self.__vbox_manager.constants.ProcessWaitForFlag_Terminate,), 3000)
+
+	def _create_guest_session(self) -> None:
+		if self.__guest_session is not None:
+			return
+
+		session = self.__vbox_manager.getSessionObject(self.__vbox)
+
+		self.__machine.lockMachine(session, self.__vbox_manager.constants.LockType_Shared)
+
+		guest_session = session.console.guest.createSession(self.__guest_username, self.__guest_password, "", f"{self.name}-guest-session")
+
+		guest_session.waitForArray((self.__vbox_manager.constants.GuestSessionWaitForFlag_Start,), 3000)
+
+		self.__control_session = session
+		self.__guest_session = guest_session
+
+	def _close_guest_session(self) -> None:
+		if self.__guest_session is not None:
+			with suppress(Exception):
+				self.__guest_session.close()
+
+			self.__guest_session = None
+
+		if self.__control_session is not None:
+			with suppress(Exception):
+				self.__control_session.unlockMachine()
+
+			self.__control_session = None
 
 	def __perf_monitor(self) -> None:
 		while self.__perf_monitor_state:
