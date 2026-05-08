@@ -41,9 +41,9 @@ def main() -> None:
 
 	for vm in vms:
 		vm.start_vm("gui")
-		time.sleep(10)
+		time.sleep(30)
 
-	time.sleep(15)
+	time.sleep(35)
 
 	pids: dict[str, int] = {}
 
